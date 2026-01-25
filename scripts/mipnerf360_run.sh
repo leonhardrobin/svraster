@@ -6,7 +6,7 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-DATA_ROOT=data/360_v2
+DATA_ROOT=/nfs/lschnaitl/projects/360_v2
 
 lanuch_exp() {
     local scene_name="$1"

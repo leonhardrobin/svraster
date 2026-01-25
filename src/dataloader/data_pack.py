@@ -206,14 +206,17 @@ class CameraCreator:
 
         # Convert image to tensor
         tensor = torch.tensor(np.array(image), dtype=torch.float32).moveaxis(-1, 0) / 255.0
+        is_alpha_mask = False  # Flag to track if mask comes from alpha channel
         if tensor.shape[0] == 4:
             # Blend alpha channel
             tensor, mask = tensor.split([3, 1], dim=0)
+            is_alpha_mask = True # Set flag
             if not self.skip_blend_alpha:
                 tensor = tensor * mask + int(self.alpha_is_white) * (1 - mask)
 
         # Conver mask to tensor if there is
-        if mask is not None:
+        # Only process if mask is NOT from alpha (i.e., it is a PIL Image)
+        if mask is not None and not is_alpha_mask:
             size = tensor.shape[-2:][::-1]
             if mask.size != size:
                 mask = mask.resize(size)
