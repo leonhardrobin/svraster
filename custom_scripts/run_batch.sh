@@ -1,17 +1,11 @@
 #!/bin/bash
 
-# ================= CONFIGURATION =================
-# Set the base absolute path to your project root
 PROJECT_ROOT="/nfs/lschnaitl/projects/svraster"
 DATA_ROOT="/nfs/lschnaitl/projects/nerf_synthetic"
 
-# Define the list of directories you want to train on
 TARGET_DIRS=("chair" "drums" "ficus" "hotdog" "lego" "materials" "mic" "ship")
-# =================================================
 
-# Loop through each directory
 for dir_name in "${TARGET_DIRS[@]}"; do
-    # Construct the specific paths based on the directory name
     SOURCE_PATH="${DATA_ROOT}/${dir_name}/"
     MODEL_PATH="output/nerf_synthetic/${dir_name}"
 
@@ -20,7 +14,6 @@ for dir_name in "${TARGET_DIRS[@]}"; do
     echo "Source Path: $SOURCE_PATH"
     echo "Model Output: $MODEL_PATH"
 
-    # Check if the processed data actually exists before trying to train
     if [ -d "$SOURCE_PATH" ]; then
         python train.py \
             --eval \

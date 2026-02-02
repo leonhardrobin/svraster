@@ -29,8 +29,6 @@ try:
     seg_model = SegformerForSemanticSegmentation.from_pretrained(MODEL_NAME).cuda()
     seg_model.eval()
     
-    # Pre-compute constants for normalization
-    # Image processor usually gives list, convert to tensor
     seg_mean = torch.tensor(image_processor.image_mean, dtype=torch.float32, device="cuda").view(1, 3, 1, 1)
     seg_std = torch.tensor(image_processor.image_std, dtype=torch.float32, device="cuda").view(1, 3, 1, 1)
 except Exception as e:
@@ -43,93 +41,64 @@ def run_segformer(image_tensor):
     Runs Segformer on a single image tensor (C, H, W) normalized [0,1].
     Returns integer class mask (H, W).
     """
-    # 1. Resize/Pad to expected input size (simple resize to nearest 32 multiple)
-    # The notebook logic was a bit complex, simplifying for robustness here:
     H, W = image_tensor.shape[-2:]
     
-    # Resize to something manageable for Segformer (e.g. max dimension 640)
-    # This matches the 'nvidia/segformer-b5-finetuned-ade-640-640' expectation
     target_dim = 640
     scale = target_dim / max(H, W)
     tH, tW = int(round(H * scale / 32) * 32), int(round(W * scale / 32) * 32)
 
-    # Input image is usually [0, 1], Segformer expects normalized with mean/std
-    # Resize
     img_resized = F.interpolate(image_tensor.unsqueeze(0), size=(tH, tW), mode='bilinear', align_corners=False)
     
-    # Normalize
     pixel_values = (img_resized - seg_mean) / seg_std
     
-    # Inference
     with torch.no_grad():
         outputs = seg_model(pixel_values)
         logits = outputs.logits # [1, 150, H/4, W/4]
         
-    # Upsample logits back to original input resolution
     logits = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
     
-    # Get class map
     pred_seg = logits.argmax(dim=1).squeeze(0) # [H, W]
     return pred_seg
-
-# ==========================================
-# 2. Modified Filter Function
-# ==========================================
 
 def filter_grid_by_semantics(args, voxel_model, grid_pts_xyz, data_pack, target_id):
     print(f"Filtering SDF for Semantic ID: {target_id}...")
     print(f"  > Threshold: {args.sem_conf*100}% consensus required")
     print(f"  > Erosion:   {args.sem_erode} pixels")
     
-    # Initialize voting counters
     semantic_votes = torch.zeros(grid_pts_xyz.shape[0], dtype=torch.int32, device="cuda")
     total_valid_views = torch.zeros(grid_pts_xyz.shape[0], dtype=torch.int32, device="cuda")
     
     cam_lst = data_pack.get_train_cameras()
     
     for cam in tqdm(cam_lst, desc="Semantic Projection"):
-        # 1. Render Depth
         render_pkg = voxel_model.render(cam, output_depth=True) 
         frame_depth = render_pkg['raw_depth'][[0]] 
         H, W = frame_depth.shape[-2:] 
 
-        # 2. Generate Semantic Mask
         img_tensor = cam.image.cuda() 
         if img_tensor.ndim == 4: img_tensor = img_tensor.squeeze(0)
         
         frame_semantic = run_segformer(img_tensor) # [H_orig, W_orig]
 
-        # --- NEW: 2D EROSION (Shrink the mask) ---
         if args.sem_erode > 0:
-            # Convert to numpy for OpenCV
             mask_np = frame_semantic.cpu().numpy().astype(np.uint8)
-            # Create kernel
             kernel = np.ones((args.sem_erode, args.sem_erode), np.uint8)
-            # Erode specific label? No, simpler to erode the binary result match later.
-            # Actually, standard erosion on the ID map destroys boundaries.
-            # Strategy: Isolate target ID -> Binary Erode -> Put back
             
             binary_mask = (mask_np == target_id).astype(np.uint8)
             eroded_binary = cv2.erode(binary_mask, kernel, iterations=1)
             
-            # Where we eroded away the target, set to "background" (e.g. -1 or 0)
-            # We only modify pixels that *were* target but are now 0
             diff = binary_mask - eroded_binary
             mask_np[diff == 1] = 0 # clear the edge pixels
             
             frame_semantic = torch.from_numpy(mask_np).cuda().long()
-        # ------------------------------------------
 
-        # Resize to match Render Resolution
         if frame_semantic.shape[-2:] != (H, W):
             frame_semantic = frame_semantic.float().unsqueeze(0).unsqueeze(0)
             frame_semantic = F.interpolate(frame_semantic, size=(H, W), mode='nearest')
             frame_semantic = frame_semantic.squeeze(0).squeeze(0).long()
 
-        # 3. Project grid points
         pts_uv = cam.project(grid_pts_xyz)
 
-        # 4. Filter outside
         inside_mask = (pts_uv.abs() <= 1).all(-1)
         valid_indices = torch.where(inside_mask)[0]
         if len(valid_indices) == 0: continue
@@ -137,7 +106,6 @@ def filter_grid_by_semantics(args, voxel_model, grid_pts_xyz, data_pack, target_
         valid_uv = pts_uv[valid_indices]
         valid_pts = grid_pts_xyz[valid_indices]
 
-        # 5. Depth check
         pts_frame_depth = F.grid_sample(
             frame_depth.view(1, 1, H, W), valid_uv.view(1, 1, -1, 2),
             mode='nearest', align_corners=False).flatten()
@@ -150,30 +118,21 @@ def filter_grid_by_semantics(args, voxel_model, grid_pts_xyz, data_pack, target_
         valid_uv = valid_uv[depth_mask]
         if len(valid_indices) == 0: continue
             
-        # 6. Sample Semantics
         pts_semantic_val = F.grid_sample(
             frame_semantic.float().view(1, 1, H, W), valid_uv.view(1, 1, -1, 2),
             mode='nearest', align_corners=False).flatten().long()
 
-        # 7. Vote
         match_mask = (pts_semantic_val == target_id)
         semantic_votes[valid_indices[match_mask]] += 1
         total_valid_views[valid_indices] += 1
 
-    # Final Decision
     has_views = total_valid_views > 0
     ratio = semantic_votes.float() / (total_valid_views.float() + 1e-8)
     
-    # --- NEW: DYNAMIC THRESHOLD ---
     final_mask = has_views & (ratio >= args.sem_conf) 
-    # ------------------------------
     
     print(f"Retained {final_mask.sum()} / {len(final_mask)} voxels for label {target_id}")
     return final_mask
-
-# ==========================================
-# 3. Standard Functions (Unchanged logic)
-# ==========================================
 
 def tsdf_fusion(cam_lst, depth_lst, alpha_lst, grid_pts_xyz, trunc_dist, crop_border, alpha_thres):
     assert len(cam_lst) == len(depth_lst)
@@ -191,7 +150,6 @@ def tsdf_fusion(cam_lst, depth_lst, alpha_lst, grid_pts_xyz, trunc_dist, crop_bo
     return tsdf
 
 def extract_mesh_progressive(args, data_pack, voxel_model, init_lv, final_lv, crop_bbox):
-    # Render depth and alpha
     cam_lst = data_pack.get_train_cameras()
     depth_lst = []
     alpha_lst = []
@@ -354,7 +312,7 @@ if __name__ == "__main__":
         data_device=cfg.data.data_device,
         use_test=cfg.data.eval,
         test_every=cfg.data.test_every,
-        camera_params_only=False, # CHANGED: We need images now!
+        camera_params_only=False,
     )
 
     voxel_model = SparseVoxelModel(
