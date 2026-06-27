@@ -14,7 +14,8 @@ for dir_name in "${TARGET_DIRS[@]}"; do
     if [ -d "$MODEL_PATH" ]; then
         python extract_mesh.py $MODEL_PATH \
             --use_vert_color \
-            --mesh_fname mesh_svraster_${dir_name}_v3
+            --mesh_fname mesh_svraster_${dir_name}_v6 \
+            --final_lv 9
 
             
         echo "Finished mesh extraction for $dir_name"

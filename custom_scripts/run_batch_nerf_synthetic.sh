@@ -17,7 +17,7 @@ for dir_name in "${TARGET_DIRS[@]}"; do
     if [ -d "$SOURCE_PATH" ]; then
         python train.py \
             --eval \
-            --cfg_files cfg/synthetic_nerf.yaml \
+            --cfg_files $PROJECT_ROOT/cfg/synthetic_nerf.yaml \
             --source_path $SOURCE_PATH \
             --model_path $MODEL_PATH \
             --lambda_normal_dmean 0.001 \

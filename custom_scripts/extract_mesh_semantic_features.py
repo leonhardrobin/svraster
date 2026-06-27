@@ -1,6 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import os
+import sys
+
+# Ensure project root is in sys.path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import math
 import time
 import numpy as np
@@ -8,10 +16,7 @@ from tqdm import tqdm
 import trimesh
 import torch
 import torch.nn.functional as F
-
-# --- Segformer Imports ---
-from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
-# -------------------------
+from scipy.spatial import cKDTree
 
 import svraster_cuda
 from src.config import cfg, update_config
@@ -23,116 +28,45 @@ from src.sparse_voxel_model import SparseVoxelModel
 from src.utils.fuser_utils import Fuser
 import cv2
 
-MODEL_NAME = "nvidia/segformer-b5-finetuned-ade-640-640"
-try:
-    image_processor = AutoImageProcessor.from_pretrained(MODEL_NAME, use_fast=True)
-    seg_model = SegformerForSemanticSegmentation.from_pretrained(MODEL_NAME).cuda()
-    seg_model.eval()
-    
-    seg_mean = torch.tensor(image_processor.image_mean, dtype=torch.float32, device="cuda").view(1, 3, 1, 1)
-    seg_std = torch.tensor(image_processor.image_std, dtype=torch.float32, device="cuda").view(1, 3, 1, 1)
-except Exception as e:
-    print(f"Error loading Segformer: {e}")
-    print("Ensure you have transformers installed: pip install transformers")
-    exit(1)
-
-def run_segformer(image_tensor):
+def filter_grid_by_semantics(args, voxel_model, grid_pts_xyz, semantic_features, target_id):
     """
-    Runs Segformer on a single image tensor (C, H, W) normalized [0,1].
-    Returns integer class mask (H, W).
+    Filters grid points by querying the pre-fused 3D semantic volume.
+    Uses CPU KDTree to avoid GPU OOM on large scenes.
     """
-    H, W = image_tensor.shape[-2:]
+    print(f"Filtering SDF for Semantic ID: {target_id} using 3D feature volume...")
     
-    target_dim = 640
-    scale = target_dim / max(H, W)
-    tH, tW = int(round(H * scale / 32) * 32), int(round(W * scale / 32) * 32)
-
-    img_resized = F.interpolate(image_tensor.unsqueeze(0), size=(tH, tW), mode='bilinear', align_corners=False)
+    print("  > Moving voxel centers to CPU...")
+    centers = voxel_model.vox_center.detach().cpu().numpy()
     
-    pixel_values = (img_resized - seg_mean) / seg_std
+    print("  > Moving query grid to CPU...")
+    query_pts = grid_pts_xyz.detach().cpu().numpy()
     
-    with torch.no_grad():
-        outputs = seg_model(pixel_values)
-        logits = outputs.logits # [1, 150, H/4, W/4]
-        
-    logits = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
+    print(f"  > Building KDTree for {len(centers)} voxels (this might take a moment)...")
+    tree = cKDTree(centers)
     
-    pred_seg = logits.argmax(dim=1).squeeze(0) # [H, W]
-    return pred_seg
-
-def filter_grid_by_semantics(args, voxel_model, grid_pts_xyz, data_pack, target_id):
-    print(f"Filtering SDF for Semantic ID: {target_id}...")
-    print(f"  > Threshold: {args.sem_conf*100}% consensus required")
-    print(f"  > Erosion:   {args.sem_erode} pixels")
+    print(f"  > Querying {len(query_pts)} grid points...")
+    _, min_idxs = tree.query(query_pts, k=1, workers=-1)
     
-    semantic_votes = torch.zeros(grid_pts_xyz.shape[0], dtype=torch.int32, device="cuda")
-    total_valid_views = torch.zeros(grid_pts_xyz.shape[0], dtype=torch.int32, device="cuda")
+    min_idxs = torch.from_numpy(min_idxs).long()
     
-    cam_lst = data_pack.get_train_cameras()
+    if semantic_features.is_cuda:
+        min_idxs = min_idxs.cuda()
+    else:
+        min_idxs = min_idxs.cpu()
+
+    print("  > processing probabilities...")
+    probs = torch.softmax(semantic_features, dim=1)
     
-    for cam in tqdm(cam_lst, desc="Semantic Projection"):
-        render_pkg = voxel_model.render(cam, output_depth=True) 
-        frame_depth = render_pkg['raw_depth'][[0]] 
-        H, W = frame_depth.shape[-2:] 
-
-        img_tensor = cam.image.cuda() 
-        if img_tensor.ndim == 4: img_tensor = img_tensor.squeeze(0)
-        
-        frame_semantic = run_segformer(img_tensor) # [H_orig, W_orig]
-
-        if args.sem_erode > 0:
-            mask_np = frame_semantic.cpu().numpy().astype(np.uint8)
-            kernel = np.ones((args.sem_erode, args.sem_erode), np.uint8)
-            
-            binary_mask = (mask_np == target_id).astype(np.uint8)
-            eroded_binary = cv2.erode(binary_mask, kernel, iterations=1)
-            
-            diff = binary_mask - eroded_binary
-            mask_np[diff == 1] = 0 # clear the edge pixels
-            
-            frame_semantic = torch.from_numpy(mask_np).cuda().long()
-
-        if frame_semantic.shape[-2:] != (H, W):
-            frame_semantic = frame_semantic.float().unsqueeze(0).unsqueeze(0)
-            frame_semantic = F.interpolate(frame_semantic, size=(H, W), mode='nearest')
-            frame_semantic = frame_semantic.squeeze(0).squeeze(0).long()
-
-        pts_uv = cam.project(grid_pts_xyz)
-
-        inside_mask = (pts_uv.abs() <= 1).all(-1)
-        valid_indices = torch.where(inside_mask)[0]
-        if len(valid_indices) == 0: continue
-
-        valid_uv = pts_uv[valid_indices]
-        valid_pts = grid_pts_xyz[valid_indices]
-
-        pts_frame_depth = F.grid_sample(
-            frame_depth.view(1, 1, H, W), valid_uv.view(1, 1, -1, 2),
-            mode='nearest', align_corners=False).flatten()
-
-        pts_dist_to_cam = ((valid_pts - cam.position) @ cam.lookat)
-        depth_margin = args.bandwidth_vox * 2.0 
-        depth_mask = (pts_frame_depth - pts_dist_to_cam).abs() < depth_margin
-        
-        valid_indices = valid_indices[depth_mask]
-        valid_uv = valid_uv[depth_mask]
-        if len(valid_indices) == 0: continue
-            
-        pts_semantic_val = F.grid_sample(
-            frame_semantic.float().view(1, 1, H, W), valid_uv.view(1, 1, -1, 2),
-            mode='nearest', align_corners=False).flatten().long()
-
-        match_mask = (pts_semantic_val == target_id)
-        semantic_votes[valid_indices[match_mask]] += 1
-        total_valid_views[valid_indices] += 1
-
-    has_views = total_valid_views > 0
-    ratio = semantic_votes.float() / (total_valid_views.float() + 1e-8)
+    mapped_classes = probs.argmax(dim=1)[min_idxs]
+    mapped_confs = probs.max(dim=1).values[min_idxs]
     
-    final_mask = has_views & (ratio >= args.sem_conf) 
+    mask = (mapped_classes == target_id) & (mapped_confs >= args.sem_conf)
     
-    print(f"Retained {final_mask.sum()} / {len(final_mask)} voxels for label {target_id}")
-    return final_mask
+    mask = mask.to(grid_pts_xyz.device)
+    
+    print(f"Retained {mask.sum()} / {len(mask)} voxels for label {target_id}")
+    return mask
+
 
 def tsdf_fusion(cam_lst, depth_lst, alpha_lst, grid_pts_xyz, trunc_dist, crop_border, alpha_thres):
     assert len(cam_lst) == len(depth_lst)
@@ -149,7 +83,8 @@ def tsdf_fusion(cam_lst, depth_lst, alpha_lst, grid_pts_xyz, trunc_dist, crop_bo
     tsdf = fuser.tsdf.squeeze(1).contiguous()
     return tsdf
 
-def extract_mesh_progressive(args, data_pack, voxel_model, init_lv, final_lv, crop_bbox):
+def extract_mesh_progressive(args, data_pack, voxel_model, init_lv, final_lv, crop_bbox, semantic_features=None):
+    # Render depth and alpha
     cam_lst = data_pack.get_train_cameras()
     depth_lst = []
     alpha_lst = []
@@ -188,14 +123,14 @@ def extract_mesh_progressive(args, data_pack, voxel_model, init_lv, final_lv, cr
             vol.pruning(prune_mask)
             vol.subdividing(torch.ones([vol.num_voxels], dtype=torch.bool))
 
-    if args.semantic_id is not None:
-        semantic_mask = filter_grid_by_semantics(args, voxel_model, vol.grid_pts_xyz, data_pack, args.semantic_id)
+    if args.semantic_id is not None and semantic_features is not None:
+        semantic_mask = filter_grid_by_semantics(args, voxel_model, vol.grid_pts_xyz, semantic_features, args.semantic_id)
         grid_tsdf[~semantic_mask] = 100.0 
 
     verts, faces = torch_marching_cubes_grid(grid_pts_val=grid_tsdf, grid_pts_xyz=vol.grid_pts_xyz, vox_key=vol.vox_key, iso=0)
     return trimesh.Trimesh(verts.cpu().numpy(), faces.cpu().numpy())
 
-def extract_mesh(args, data_pack, voxel_model, final_lv, crop_bbox, iso=0):
+def extract_mesh(args, data_pack, voxel_model, final_lv, crop_bbox, semantic_features=None, iso=0):
     cam_lst = data_pack.get_train_cameras()
     depth_lst = []
     alpha_lst = []
@@ -232,8 +167,8 @@ def extract_mesh(args, data_pack, voxel_model, final_lv, crop_bbox, iso=0):
     
     grid_tsdf = tsdf_fusion(cam_lst, depth_lst, alpha_lst, vol.grid_pts_xyz, bandwidth, args.crop_border, args.alpha_thres)
 
-    if args.semantic_id is not None:
-        semantic_mask = filter_grid_by_semantics(args, voxel_model, vol.grid_pts_xyz, data_pack, args.semantic_id)
+    if args.semantic_id is not None and semantic_features is not None:
+        semantic_mask = filter_grid_by_semantics(args, voxel_model, vol.grid_pts_xyz, semantic_features, args.semantic_id)
         grid_tsdf[~semantic_mask] = 100.0
 
     verts, faces = torch_marching_cubes_grid(grid_pts_val=grid_tsdf, grid_pts_xyz=vol.grid_pts_xyz, vox_key=vol.vox_key, iso=iso)
@@ -291,7 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("--alpha_thres", default=0.5, type=float)
     parser.add_argument("--semantic_id", default=None, type=int)
     parser.add_argument("--sem_conf", default=0.6, type=float, help="Confidence threshold (0.0 to 1.0). Higher = stricter.")
-    parser.add_argument("--sem_erode", default=0, type=int, help="Pixels to erode from 2D mask before projection. Good for separating floor.")
+    parser.add_argument("--sem_erode", default=0, type=int, help="Deprecated for pre-fused features.")
     parser.add_argument("--use_mean", action='store_true')
     parser.add_argument("--use_vert_color", action='store_true')
     parser.add_argument("--use_clean", action='store_true')
@@ -301,6 +236,23 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print("Rendering " + args.model_path)
     update_config(os.path.join(args.model_path, 'config.yaml'))
+
+    semantic_features = None
+    if args.semantic_id is not None:
+        sem_path = os.path.join(args.model_path, 'semantic_features.pt')
+        if os.path.exists(sem_path):
+            print(f"Loading semantic features from {sem_path}")
+            # Added weights_only=False to suppress the warning if you trust the file source
+            # If you want to be safe, you can remove weights_only=False but ignore the warning
+            try:
+                semantic_features = torch.load(sem_path, weights_only=False)
+            except TypeError:
+                 # Fallback for older torch versions
+                 semantic_features = torch.load(sem_path)
+        else:
+            print(f"ERROR: semantic_features.pt not found at {sem_path}")
+            print("Please run fuse_semantic.py first.")
+            exit(1)
 
     data_pack = DataPack(
         source_path=cfg.data.source_path,
@@ -340,9 +292,9 @@ if __name__ == "__main__":
     with torch.no_grad():
         if args.progressive:
             if args.semantic_id is not None: fname += f'_lv{args.init_lv}-{args.final_lv}'
-            mesh = extract_mesh_progressive(args, data_pack, voxel_model, args.init_lv, args.final_lv, crop_bbox)
+            mesh = extract_mesh_progressive(args, data_pack, voxel_model, args.init_lv, args.final_lv, crop_bbox, semantic_features=semantic_features)
         else:
-            mesh = extract_mesh(args, data_pack, voxel_model, args.final_lv, crop_bbox)
+            mesh = extract_mesh(args, data_pack, voxel_model, args.final_lv, crop_bbox, semantic_features=semantic_features)
             fname += f'_lv{args.final_lv}_adaptive'
 
     if args.use_mean: fname += '_dmean'
